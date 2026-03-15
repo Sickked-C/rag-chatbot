@@ -1,61 +1,65 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from groq import Groq
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from contextlib import asynccontextmanager
+from groq import Groq
 from decouple import config
 import os
 import shutil
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    print("[STARTUP] Loading embedding model...")
-    _state["embeddings"] = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/paraphrase-MiniLM-L3-v2"
-    )
-    print("[STARTUP] Embedding model ready!")
-    yield
-    # Shutdown (nếu cần cleanup)
-
-app = FastAPI(title="RAG Chatbot API", lifespan=lifespan)
 
 # ─────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────
 GROQ_API_KEY = config('GROQ_API_KEY')
 UPLOAD_DIR = "uploaded_docs"
-CHROMA_DIR = "chroma_db"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-_state = {"retriever": None, "embeddings": None}
+_state = {
+    "chunks": None,
+    "vectorizer": None,
+    "vectors": None
+}
+
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+# ─────────────────────────────────────────
+# Lifespan
+# ─────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[STARTUP] Ready!")
+    yield
+
+app = FastAPI(title="RAG Chatbot API", lifespan=lifespan)
 
 # ─────────────────────────────────────────
 # Build RAG pipeline
 # ─────────────────────────────────────────
 def build_rag_chain(file_path: str):
+    # 1. Load PDF
     loader = PyPDFLoader(file_path)
     documents = loader.load()
     print(f"[DEBUG] Loaded {len(documents)} pages")
 
+    # 2. Split chunks
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
+        chunk_size=500,
+        chunk_overlap=50
     )
     chunks = splitter.split_documents(documents)
     print(f"[DEBUG] Split into {len(chunks)} chunks")
 
-    # Dùng embeddings đã load sẵn từ startup
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=_state["embeddings"],  # ← dùng từ _state
-        persist_directory=CHROMA_DIR
-    )
-    _state["retriever"] = vectorstore.as_retriever(search_kwargs={"k": 3})
-    print(f"[DEBUG] Retriever ready!")
+    # 3. TF-IDF vectorize
+    texts = [chunk.page_content for chunk in chunks]
+    vectorizer = TfidfVectorizer()
+    vectors = vectorizer.fit_transform(texts)
+
+    _state["chunks"] = texts
+    _state["vectorizer"] = vectorizer
+    _state["vectors"] = vectors
+    print(f"[DEBUG] TF-IDF ready!")
 
     return len(chunks)
 
@@ -64,11 +68,14 @@ def build_rag_chain(file_path: str):
 # ─────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"message": "RAG Chatbot API — Groq + HuggingFace"}
+    return {"message": "RAG Chatbot API — TF-IDF + Groq LLaMA"}
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "document_loaded": _state["retriever"] is not None}
+    return {
+        "status": "ok",
+        "document_loaded": _state["chunks"] is not None
+    }
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -93,33 +100,30 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 @app.post("/ask")
 async def ask_question(question: str):
-    if _state["retriever"] is None:
+    if _state["chunks"] is None:
         raise HTTPException(
             status_code=400,
             detail="No document uploaded yet. Please upload a PDF first."
         )
 
     try:
-        # Retrieve relevant chunks
-        docs = _state["retriever"].invoke(question)
-        context = "\n\n".join(doc.page_content for doc in docs)
+        # Tìm chunks liên quan bằng TF-IDF
+        question_vec = _state["vectorizer"].transform([question])
+        similarities = cosine_similarity(question_vec, _state["vectors"]).flatten()
+        top_indices = similarities.argsort()[-3:][::-1]
+        context = "\n\n".join([_state["chunks"][i] for i in top_indices])
 
-        # Call Groq LLM
+        # Gọi Groq LLaMA
         response = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a helpful assistant. Answer questions based only on the provided context."
+                    "content": "Answer questions based only on the provided context. If the answer is not in the context, say 'I don't have enough information.'"
                 },
                 {
                     "role": "user",
-                    "content": f"""Context:
-{context}
-
-Question: {question}
-
-Answer based only on the context above. If the answer is not in the context, say "I don't have enough information." """
+                    "content": f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
                 }
             ],
             temperature=0.3
@@ -129,11 +133,8 @@ Answer based only on the context above. If the answer is not in the context, say
             "question": question,
             "answer": response.choices[0].message.content,
             "sources": [
-                {
-                    "page": doc.metadata.get("page", 0) + 1,
-                    "content": doc.page_content[:200]
-                }
-                for doc in docs
+                {"content": _state["chunks"][i][:200]}
+                for i in top_indices
             ]
         }
 
@@ -141,4 +142,3 @@ Answer based only on the context above. If the answer is not in the context, say
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
