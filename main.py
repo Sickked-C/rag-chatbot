@@ -4,12 +4,23 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from groq import Groq
+from contextlib import asynccontextmanager
 from decouple import config
 import os
 import shutil
 
-app = FastAPI(title="RAG Chatbot API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("[STARTUP] Loading embedding model...")
+    _state["embeddings"] = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    print("[STARTUP] Embedding model ready!")
+    yield
+    # Shutdown (nếu cần cleanup)
 
+app = FastAPI(title="RAG Chatbot API", lifespan=lifespan)
 # ─────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────
@@ -18,19 +29,17 @@ UPLOAD_DIR = "uploaded_docs"
 CHROMA_DIR = "chroma_db"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-_state = {"retriever": None}
+_state = {"retriever": None, "embeddings": None}
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ─────────────────────────────────────────
 # Build RAG pipeline
 # ─────────────────────────────────────────
 def build_rag_chain(file_path: str):
-    # 1. Load PDF
     loader = PyPDFLoader(file_path)
     documents = loader.load()
     print(f"[DEBUG] Loaded {len(documents)} pages")
 
-    # 2. Split
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200
@@ -38,13 +47,10 @@ def build_rag_chain(file_path: str):
     chunks = splitter.split_documents(documents)
     print(f"[DEBUG] Split into {len(chunks)} chunks")
 
-    # 3. Embed locally với HuggingFace (không cần API key)
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
+    # Dùng embeddings đã load sẵn từ startup
     vectorstore = Chroma.from_documents(
         documents=chunks,
-        embedding=embeddings,
+        embedding=_state["embeddings"],  # ← dùng từ _state
         persist_directory=CHROMA_DIR
     )
     _state["retriever"] = vectorstore.as_retriever(search_kwargs={"k": 3})
@@ -134,3 +140,4 @@ Answer based only on the context above. If the answer is not in the context, say
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
