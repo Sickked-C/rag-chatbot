@@ -14,13 +14,14 @@ async def lifespan(app: FastAPI):
     # Startup
     print("[STARTUP] Loading embedding model...")
     _state["embeddings"] = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
+        model_name="sentence-transformers/paraphrase-MiniLM-L3-v2"
     )
     print("[STARTUP] Embedding model ready!")
     yield
     # Shutdown (nếu cần cleanup)
 
 app = FastAPI(title="RAG Chatbot API", lifespan=lifespan)
+
 # ─────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────
