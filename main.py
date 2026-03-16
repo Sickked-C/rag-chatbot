@@ -6,6 +6,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from contextlib import asynccontextmanager
 from groq import Groq
 from decouple import config
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import shutil
 
@@ -33,7 +34,12 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="RAG Chatbot API", lifespan=lifespan)
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # ─────────────────────────────────────────
 # Build RAG pipeline
 # ─────────────────────────────────────────
